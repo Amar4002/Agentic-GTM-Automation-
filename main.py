@@ -1,105 +1,148 @@
-
+from pathlib import Path
+import argparse
 import pandas as pd
 from datetime import datetime
-import pyttsx3
+import time
 import os
-import random
+from dotenv import load_dotenv
+
+from llm.gemini_client import GeminiClient
+
+from messaging.twilio_client import TwilioWhatsAppClient
+from utils.logging_utils import CSVLogger
+
+load_dotenv()
+
+DEFAULT_LOG = "output_log.csv" 
 
 
-CRM_PATH = r"C:\Users\Desktop\sample_30_leads.csv" # csv file path
-OUTPUT_LOG = "output_log.csv"
-AUDIO_DIR = "voice_calls"
-os.makedirs(AUDIO_DIR, exist_ok=True)
+def parse_args():
+    p = argparse.ArgumentParser(description="Agentic GTM Automation (Gemini + Twilio)")
 
-# Reading the data
-try:
-    df = pd.read_csv(CRM_PATH)
-
-    #  matching the data with csv file 
-    df.rename(columns={
-        "Lead name": "Name",
-        "Phone number / WhatsApp": "Phone",
-        "Last contact date": "LastContactDate",
-        "Last message or call summary": "LastMessage"
-    }, inplace=True)
-
-    #  Convert date column
-    df["LastContactDate"] = pd.to_datetime(df["LastContactDate"], errors="coerce")
-
-    print(f"\n Successfully loaded and formatted data from: {CRM_PATH}")
-
-except Exception as e:
-    print(f" Error loading CRM file: {e}")
-    exit()
-
-today = datetime.now().date()
-log_data = []
-
-# required functions
-def choose_channel(phone):
-    # Choose WhatsApp for even last digit, Voice for odd.
-    last_digit = int(phone[-1]) if phone[-1].isdigit() else 0
-    return "WhatsApp" if last_digit % 2 == 0 else "Voice"
-
-def simulate_whatsapp(name, phone):
-    #  Simulate sending a WhatsApp message.
-    message = f"Hi {name}, just checking in to see if you'd like to continue our discussion this week."
-    print(f"📱 Sending WhatsApp to {name}: {message}")
-    success = random.random() > 0.1
-    return ("Success", message) if success else ("Failed", "Simulated API error")
-
-def simulate_voice_call(name, text):
-    #  Generating audio using pyttsx3.
-    engine = pyttsx3.init()
-    engine.setProperty("rate", 170)
-    engine.setProperty("volume", 1.0)
+    p.add_argument("--crm-path", type=Path, required=True, help="sample_30_leads.csv")
     
-    filename = os.path.join(AUDIO_DIR, f"{name.replace(' ', '_')}.mp3")
-    engine.save_to_file(text, filename)
-    engine.runAndWait()
-    print(f" Voice call simulated for {name} → saved to {filename}")
-    return "Success", f"Audio saved to {filename}"
+    p.add_argument("--log-path", type=Path, default=Path(DEFAULT_LOG), help="")
+    
+    p.add_argument("--days-threshold", type=int, default=3, help="Follow-up threshold in days")
+    
+    p.add_argument("--dry-run", action="store_true", help="Don’t send messages; log only")
+    
+    return p.parse_args()
 
-# Processing
-for _, lead in df.iterrows():
-    try:
-        name = lead["Name"]
-        phone = str(lead["Phone"])
-        last_contact = pd.to_datetime(lead["LastContactDate"]).date()
-        days_since = (today - last_contact).days
 
-        if days_since > 3:
-            decision = "Follow-up"
-            channel = choose_channel(phone)
+def prepare_df(path: Path):
+    df = pd.read_csv(path)
 
-            if channel == "WhatsApp":
-                status, details = simulate_whatsapp(name, phone)
-            else:
-                tts_text = f"Hi {name}, calling from GTM Assist. Following up on our last chat. Can I share a short update?"
-                status, details = simulate_voice_call(name, tts_text)
+
+    df["LastContactDate"] = pd.to_datetime(df["LastContactDate"], errors="coerce")
+    return df
+
+
+def main():
+    args = parse_args()
+
+    if not args.crm_path.exists():
+        raise FileNotFoundError(f"CRM file not found: {args.crm_path}")
+
+    df = prepare_df(args.crm_path)
+    today = datetime.utcnow().date()
+
+    # Instantiate clients
+    llm_key = os.getenv("api key ")
+    llm = GeminiClient(api_key=llm_key)
+
+    twilio_account = os.getenv("Account_SID")
+    twilio_token = os.getenv("Auth_Token")
+    twilio_from = os.getenv("Whatsapp_from")
+
+    whatsapp_client = TwilioWhatsAppClient(
+        account_sid=twilio_account,
+        auth_token=twilio_token,
+        from_number=twilio_from
+    )
+
+    logger = CSVLogger(args.log_path)
+
+    for _, row in df.iterrows():
+        name = row.get("Name")
+        phone = str(row.get("Phone"))
+        last_msg = row.get("LastMessage", "")
+        last_contact = row.get("LastContactDate")
+
+        if pd.isna(last_contact):
+            print(f"[WARN] Skipping {name}: last contact date invalid")
+            continue
+
+        days_since = (today - last_contact.date()).days
+
+        # Skip if recently contacted
+        if days_since <= args.days_threshold:
+            print(f"[SKIP] {name}: contacted {days_since} day(s) ago")
+            logger.log({
+                "Name": name,
+                "Phone": phone,
+                "Channel": "WhatsApp",
+                "Decision": "Skip",
+                "ProviderMessageSid": "",
+                "ProviderStatus": "Skipped",
+                "LLMPrompt": "",
+                "LLMOutput": "",
+                "Timestamp": datetime.utcnow().isoformat()
+            })
+            continue
+
+        # LLM PROMPT (must remain visible)
+        prompt = (
+            f"You are a short professional sales follow-up assistant. "
+            f"Create a concise WhatsApp follow-up message (<= 160 chars).\n\n"
+            f"Name: {name}\n"
+            f"LastMessage: {last_msg}\n"
+            f"DaysSince: {days_since}\n\n"
+            f"Reply with only the message text (no explanations)."
+        )
+
+        # Generate message with Gemini
+        try:
+            llm_output = llm.generate(prompt)
+            message_text = llm_output.strip()
+        except Exception as e:
+            print(f"[ERROR] Gemini failed for {name}: {e}")
+            message_text = f"Hi {name}, following up on our last chat. Are you available this week?"
+
+        print(f"[INFO] LLM message for {name}: {message_text}")
+
+        # Dry-run mode
+        if args.dry_run:
+            provider_response = {"sid": "dryrun", "status": "dry_run"}
         else:
-            decision = "Skip"
-            channel = "N/A"
-            status = "Skipped"
-            details = f"Last contacted {days_since} day(s) ago."
+            # Try sending with retries
+            provider_response = {"sid": "", "status": "failed"}
+            for attempt in range(1, 4):  # 3 attempts
+                try:
+                    resp = whatsapp_client.send_whatsapp(
+                        to=phone,
+                        body=message_text
+                    )
+                    provider_response = {"sid": resp.sid, "status": resp.status}
+                    print(f"[SENT] to {name}: SID={resp.sid}")
+                    break
+                except Exception as e:
+                    print(f"[WARN] Attempt {attempt} failed for {name}: {e}")
+                    time.sleep(attempt * 2)
 
-        log_data.append({
+        # Log result
+        logger.log({
             "Name": name,
-            "Company": lead["Company"],
             "Phone": phone,
-            "DaysSince": days_since,
-            "Decision": decision,
-            "Channel": channel,
-            "Status": status,
-            "Details": details,
-            "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "Channel": "WhatsApp",
+            "Decision": "Follow-up",
+            "ProviderMessageSid": provider_response.get("sid", ""),
+            "ProviderStatus": provider_response.get("status", ""),
+            "LLMPrompt": prompt,
+            "LLMOutput": message_text,
+            "Timestamp": datetime.utcnow().isoformat()
         })
-    except Exception as e:
-        print(f" Error processing lead: {e}")
-        continue
-
-# Saving Logs
-log_df = pd.DataFrame(log_data)
-log_df.to_csv(OUTPUT_LOG, index=False)
 
 
+if __name__ == "__main__":
+    main()
