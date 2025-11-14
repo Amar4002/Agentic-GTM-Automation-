@@ -4,7 +4,7 @@ import os
 
 class GeminiClient:
     def __init__(self, api_key: str = None):
-        key = api_key or os.getenv("AIzaSyAQs2sILS1XQyK0kYlQilpiEWTL0MCKcUE")
+        key = api_key or os.getenv("api key")
         if not key:
             raise ValueError("GEMINI_API_KEY missing in environment")
         genai.configure(api_key=key)
